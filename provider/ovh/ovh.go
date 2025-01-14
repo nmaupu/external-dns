@@ -151,6 +151,8 @@ func (p *OVHProvider) ApplyChanges(ctx context.Context, changes *plan.Changes) (
 
 		eg, _ := errgroup.WithContext(ctx)
 		for zone := range zonesChangeUniques {
+			// This is necessary because the loop variable zone is reused in each iteration of the loop,
+			// and without this line, the goroutines launched by eg.Go would all reference the same zone variable.
 			zone := zone
 			eg.Go(func() error { return p.refresh(zone) })
 		}
@@ -374,14 +376,18 @@ func ovhGroupByNameAndType(records []ovhRecord) []*endpoint.Endpoint {
 }
 
 func newOvhChange(action int, endpoints []*endpoint.Endpoint, zones []string, records []ovhRecord) []ovhChange {
-	// Copy the records because we need to mutate the list.
-	newRecords := make([]ovhRecord, len(records))
-	copy(newRecords, records)
-
 	zoneNameIDMapper := provider.ZoneIDName{}
 	ovhChanges := make([]ovhChange, 0, countTargets(endpoints))
 	for _, zone := range zones {
 		zoneNameIDMapper.Add(zone, zone)
+	}
+
+	// Creating a recordMap to store records' IDs. This will be used in case a zone has multiple records with the same target.
+	// In order to avoid applying the action to the same OVH record, we will be removing it from the list if a match is found during the loop.
+	recordMap := make(map[string]uint64, len(records))
+	for _, rec := range records {
+		key := fmt.Sprintf("%s|%s|%s|%s", rec.Zone, rec.SubDomain, rec.FieldType, rec.Target)
+		recordMap[key] = rec.ID
 	}
 
 	for _, e := range endpoints {
@@ -410,17 +416,13 @@ func newOvhChange(action int, endpoints []*endpoint.Endpoint, zones []string, re
 				change.TTL = int64(e.RecordTTL)
 			}
 
-			// The Zone might have multiple records with the same target. In order to avoid applying the action to the
-			// same OVH record, we remove a record from the list when a match is found.
-			for i := 0; i < len(newRecords); i++ {
-				rec := newRecords[i]
-				if rec.Zone == change.Zone && rec.SubDomain == change.SubDomain && rec.FieldType == change.FieldType && rec.Target == change.Target {
-					change.ID = rec.ID
-					// Deleting this record from the list to avoid retargetting it later if a change with a similar target exists.
-					newRecords = append(newRecords[:i], newRecords[i+1:]...)
-					break
-				}
+			// If matching, delete this item from the map and retrieve ID to use in the change.
+			key := fmt.Sprintf("%s|%s|%s|%s", change.Zone, change.SubDomain, change.FieldType, change.Target)
+			if recID, found := recordMap[key]; found {
+				change.ID = recID
+				delete(recordMap, key)
 			}
+
 			ovhChanges = append(ovhChanges, change)
 		}
 	}
